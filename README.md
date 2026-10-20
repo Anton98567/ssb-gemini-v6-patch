@@ -58,6 +58,39 @@ outbound, который соединяется с Google с исходным а
    убедиться, что всё работает на 100%. Отдельный запуск без правок конфига:
    `ssb-gemini-v6-patch.sh test`.
 
+## Что покрывается: Gemini, AI Studio и другие сервисы Google
+
+Домены Google берутся **не вручную**, а из rule-set `google` (`geosite-google.srs`,
+сборка [SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) из
+[domain-list-community](https://github.com/v2fly/domain-list-community)) —
+категория `google` содержит суффиксы `google.com`, `googleapis.com`, `gstatic.com`,
+`googleusercontent.com` и сотни других, то есть покрывает **все поддомены**, включая AI Studio.
+
+| Сервис / домен | Как покрывается |
+|---|---|
+| `aistudio.google.com` (Google AI Studio) | суффикс `google.com` в rule-set `google` |
+| `makersuite.google.com` (старый URL AI Studio) | суффикс `google.com` |
+| `gemini.google.com`, `deepmind.google` | суффикс `google.com` |
+| `accounts.google.com` (логин Google) | суффикс `google.com` |
+| `alkalimakersuite-pa.googleapis.com` (API-бэкенд AI Studio) | суффикс `googleapis.com` |
+| `generativelanguage.googleapis.com` (Gemini API) | суффикс `googleapis.com` + явное правило патча |
+| `gstatic.com`, `googleusercontent.com` (ресурсы UI) | свои суффиксы в rule-set `google` |
+
+Проверено на живом сервере (реальный прогон):
+
+```text
+https://aistudio.google.com/        -> HTTP 302 (reachable via IPv6)
+https://aistudio.google.com/app     -> HTTP 302 (reachable via IPv6)
+aistudio.google.com через outbound gemini-v6 -> {"delay": 231} ms
+gemini.google.com  через outbound gemini-v6 -> {"delay": 49} ms
+```
+
+То есть весь стек AI Studio — веб-интерфейс, API-бэкенд, логин и статика —
+уходит через глобальный IPv6 без дополнительных правок. **Важно:** правило
+работает для трафика, который приходит на сервер через прокси-клиент ssb;
+в клиентских конфигах Google должен быть направлен в прокси (в ssb это
+правило `rule_set: google` уже есть — как и в этом патче).
+
 ## Требования
 
 * сервер с установленным [Secret-Sing-Box](https://github.com/A-Zuro/Secret-Sing-Box)
@@ -270,4 +303,7 @@ systemctl reload sing-box
 * режим `test` и автотест в конце `apply`: 7 проверок связи с Gemini по IPv6
   (назначение адреса, AAAA, `generate_204` → 204, доступность API Gemini,
   исходящий адрес без NAT, сквозной тест через outbound `gemini-v6` с замером
-  задержки) — `OK=7 FAIL=0` на рабочем сервере.
+  задержки) — `OK=7 FAIL=0` на рабочем сервере;
+* Google AI Studio: `aistudio.google.com` доступен через глобальный IPv6
+  (HTTP 302) и проходит через outbound `gemini-v6` (сквозной тест с замером
+  задержки) — домен покрывается rule-set `google` (geosite:google).

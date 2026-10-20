@@ -54,6 +54,9 @@ outbound, который соединяется с Google с исходным а
 4. **Проверяет конфиг** через `sing-box check` — при ошибке автоматически
    откатывает бэкап.
 5. **Перезагружает sing-box** (`systemctl reload`, fallback `systemctl restart`).
+6. **Прогоняет тесты связи с Gemini по IPv6** (7 проверок, см. ниже) — чтобы
+   убедиться, что всё работает на 100%. Отдельный запуск без правок конфига:
+   `ssb-gemini-v6-patch.sh test`.
 
 ## Требования
 
@@ -77,6 +80,7 @@ chmod 700 /usr/local/sbin/ssb-gemini-v6-patch.sh
 ssb-gemini-v6-patch.sh apply    # добавить или обновить патч (режим по умолчанию)
 ssb-gemini-v6-patch.sh status   # показать текущее состояние патча
 ssb-gemini-v6-patch.sh remove   # убрать outbound и правила, добавленные патчем
+ssb-gemini-v6-patch.sh test     # проверить связь с Gemini по IPv6 (без правок конфига)
 ```
 
 ### Как указать IPv6
@@ -101,6 +105,46 @@ Enter the IPv6 of this server (number or full address) [default: 2001:db8:1::10]
 `2001:db8:2::20` или `2001:db8:2::20/64`). Enter берёт значение по умолчанию
 (автоопределённый адрес). Невалидный ввод (например, `fe80::…` или ULA `fd00::…`)
 отклоняется, и запрос повторяется.
+
+### Тесты связи с Gemini по IPv6
+
+`ssb-gemini-v6-patch.sh test` (и автоматически в конце `apply`) прогоняет 7 проверок —
+они показывают, что Gemini доступен именно через ваш IPv6, «на 100%»:
+
+1. IPv6 назначен на интерфейсе сервера (иначе `inet6_bind_address` не сможет bind);
+2. у `gemini.google.com` есть AAAA-запись (в `domain_resolver` стоит `ipv6_only`);
+3. `https://gemini.google.com/generate_204` через IPv6 → **HTTP 204**;
+4. `https://www.google.com/generate_204` через IPv6 → **HTTP 204** (контрольная точка);
+5. `https://generativelanguage.googleapis.com/` через IPv6 отвечает (2xx–4xx;
+   404 на корне — норма, важна сама доступность API Gemini);
+6. исходящий адрес соединения равен вашему IPv6 (нет NAT/маскарада) —
+   проверяется по `api6.ipify.org` / `ifconfig.me`;
+7. **сквозной тест через сам outbound `gemini-v6`** sing-box: запрос к
+   `gemini.google.com/generate_204` через Clash API (`experimental.clash_api`)
+   и замер задержки. Если `clash_api` в конфиге не включён — проверка
+   помечается `[SKIP]`.
+
+Пример вывода (реальный прогон):
+
+```text
+=== connectivity tests to Gemini/Google (source IPv6: 2001:db8:1::10) ===
+  [OK]   IPv6 2001:db8:1::10 is assigned on this server
+  [OK]   DNS: gemini.google.com resolves to IPv6 (AAAA)
+  [OK]   gemini.google.com/generate_204 via IPv6 -> HTTP 204
+  [OK]   www.google.com/generate_204 via IPv6 -> HTTP 204
+  [OK]   generativelanguage.googleapis.com via IPv6 -> HTTP 404 (reachable)
+  [OK]   outbound source address is 2001:db8:1::10 (no NAT)
+  [OK]   sing-box outbound gemini-v6 -> gemini.google.com works (delay 55 ms)
+--- tests: OK=7 FAIL=0 SKIP=0
+```
+
+* Итог `OK=7 FAIL=0` = всё работает; при любом `[FAIL]` скрипт завершается
+  с кодом 1 и пишет, какая именно проверка не прошла.
+* `test` сам берёт IPv6 из настроенного outbound `gemini-v6` (правки конфига
+  не делает); можно передать адрес и вручную: `ssb-gemini-v6-patch.sh test 2001:db8:1::10`.
+* Автотест в конце `apply` отключается переменной `GEMINI_SKIP_TEST=1`
+  (например, в cron/ansible, где доступ в интернет ограничен).
+* Таймаут HTTP-проверок — `GEMINI_TEST_TIMEOUT` (по умолчанию 15 секунд).
 
 Пример вывода `apply` (адреса условные):
 
@@ -222,4 +266,8 @@ systemctl reload sing-box
 * идемпотентность повторного запуска (без дубликатов правил и outbounds);
 * ручной ввод IPv6: выбор номера из списка, ввод полного адреса и адреса с `/64`,
   отклонение невалидного ввода (`fe80::…`, ULA) с повторным запросом,
-  режимы `apply <IPv6>` и `GEMINI_IPV6=...`, а также `remove` → повторный `apply`.
+  режимы `apply <IPv6>` и `GEMINI_IPV6=...`, а также `remove` → повторный `apply`;
+* режим `test` и автотест в конце `apply`: 7 проверок связи с Gemini по IPv6
+  (назначение адреса, AAAA, `generate_204` → 204, доступность API Gemini,
+  исходящий адрес без NAT, сквозной тест через outbound `gemini-v6` с замером
+  задержки) — `OK=7 FAIL=0` на рабочем сервере.

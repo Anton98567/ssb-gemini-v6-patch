@@ -11,34 +11,124 @@ SRS_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosit
 PROBE="2001:4860:4860::8888"
 GEMINI_DOMAINS="gemini.google.com generativelanguage.googleapis.com"
 MODE="${1:-apply}"
+ARG_IPV6="${2:-}"
 
 log() { echo "[gemini-v6-patch] $*"; }
 die() { echo "[gemini-v6-patch] ERROR: $*" >&2; exit 1; }
 
 usage() {
-    echo "usage: $0 [apply|remove|status]"
-    echo "  apply  - add or refresh gemini-via-IPv6 patch in ${CONFIG} (default)"
-    echo "  remove - drop outbound/rules added by this patch"
-    echo "  status - show current patch state"
+    echo "usage: $0 [apply|remove|status] [IPv6]"
+    echo "  apply [IPv6] - add or refresh gemini-via-IPv6 patch in ${CONFIG} (default)"
+    echo "  remove       - drop outbound/rules added by this patch"
+    echo "  status       - show current patch state"
+    echo
+    echo "IPv6 selection (apply), in priority order:"
+    echo "  1) argument:    $0 apply 2001:db8::1"
+    echo "  2) env var:     GEMINI_IPV6=2001:db8::1 $0 apply"
+    echo "  3) interactive prompt (asks for the IPv6 of this server)"
+    echo "  4) auto-detection (ip -6 route get $PROBE) as a last resort"
 }
 
-detect_ipv6() {
-    local ip=""
-    if [[ -n "${GEMINI_IPV6:-}" ]]; then
-        ip="$GEMINI_IPV6"
-    else
-        ip="$(ip -6 route get "$PROBE" 2>/dev/null | sed -n 's/.*src \([0-9a-fA-F:]*\).*/\1/p' | head -1 || true)"
-        if [[ -z "$ip" ]]; then
-            ip="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
-        fi
-    fi
-    [[ -n "$ip" ]] || die "global IPv6 not found (override: GEMINI_IPV6=x.x.x.x)"
+# Normalizes and validates an IPv6 address -> prints compressed form.
+# Accepts optional /prefix or %zone suffix. Fails on non-global addresses.
+normalize_ipv6() {
     python3 -c '
 import ipaddress, sys
-a = ipaddress.ip_address(sys.argv[1].strip())
-assert a.version == 6 and a.is_global, f"not a global IPv6: {a}"
+raw = sys.argv[1].strip().split("/")[0].split("%")[0]
+try:
+    a = ipaddress.ip_address(raw)
+except ValueError:
+    sys.exit("invalid IP address: %s" % raw)
+if a.version != 6:
+    sys.exit("not an IPv6 address: %s" % raw)
+if not a.is_global:
+    sys.exit("not a global IPv6: %s" % raw)
 print(a.compressed)
-' "$ip"
+' "$1"
+}
+
+# Auto-detected default (may be empty or wrong on multi-address hosts).
+auto_detect_ipv6() {
+    local ip=""
+    ip="$(ip -6 route get "$PROBE" 2>/dev/null | sed -n 's/.*src \([0-9a-fA-F:]*\).*/\1/p' | head -1 || true)"
+    if [[ -z "$ip" ]]; then
+        ip="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    fi
+    [[ -n "$ip" ]] || return 0
+    normalize_ipv6 "$ip" 2>/dev/null || true
+}
+
+# All global IPv6 addresses of the server (deduplicated, validated).
+list_ipv6_candidates() {
+    {
+        ip -6 route get "$PROBE" 2>/dev/null | sed -n 's/.*src \([0-9a-fA-F:]*\).*/\1/p' | head -1
+        ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    } | awk 'NF && !seen[$0]++' | while read -r a; do
+        normalize_ipv6 "$a" 2>/dev/null || true
+    done
+}
+
+# Sets global IPV6 (and logs its source). Interactive when run from a terminal.
+choose_ipv6() {
+    local input="" normalized="" auto="" src=""
+
+    if [[ -n "$ARG_IPV6" ]]; then
+        input="$ARG_IPV6"
+        src="command-line argument"
+    elif [[ -n "${GEMINI_IPV6:-}" ]]; then
+        input="$GEMINI_IPV6"
+        src="GEMINI_IPV6"
+    fi
+
+    if [[ -n "$input" ]]; then
+        normalized="$(normalize_ipv6 "$input")" || die "invalid IPv6 ($src): $input"
+        IPV6="$normalized"
+        log "IPv6 ($src): $IPV6"
+        return 0
+    fi
+
+    auto="$(auto_detect_ipv6 || true)"
+
+    if [[ -t 0 ]]; then
+        local -a candidates=()
+        local line
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && candidates+=("$line")
+        done < <(list_ipv6_candidates)
+        echo "Global IPv6 addresses found on this server:"
+        local i
+        for i in "${!candidates[@]}"; do
+            if [[ "${candidates[$i]}" == "$auto" ]]; then
+                printf '  %d) %s   <- auto-detected\n' "$((i + 1))" "${candidates[$i]}"
+            else
+                printf '  %d) %s\n' "$((i + 1))" "${candidates[$i]}"
+            fi
+        done
+        [[ ${#candidates[@]} -eq 0 ]] && echo "  (none found)"
+        local hint="${auto:-none}"
+        while true; do
+            input=""
+            read -r -p "Enter the IPv6 of this server (number or full address) [default: $hint]: " input || true
+            if [[ -z "$input" ]]; then
+                input="$auto"
+            elif [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#candidates[@]} )); then
+                input="${candidates[$((input - 1))]}"
+            fi
+            if [[ -z "$input" ]]; then
+                echo "nothing selected - type an IPv6 address (or Ctrl-C to abort)"
+                continue
+            fi
+            if normalized="$(normalize_ipv6 "$input")"; then
+                break
+            fi
+        done
+    else
+        [[ -n "$auto" ]] || die "no global IPv6 found (set GEMINI_IPV6=<ipv6> or run interactively)"
+        normalized="$auto"
+    fi
+
+    IPV6="$normalized"
+    log "IPv6 (${src:-manual input}): $IPV6"
 }
 
 backup_config() {
@@ -70,6 +160,7 @@ check_and_reload() {
 case "$MODE" in
     -h|--help|help) usage; exit 0 ;;
     apply|remove|status) ;;
+    *:*) ARG_IPV6="$MODE"; MODE="apply" ;;   # first argument is an IPv6 address
     *) usage; exit 1 ;;
 esac
 
@@ -119,8 +210,8 @@ PY
     exit 0
 fi
 
-IPV6="$(detect_ipv6)"
-log "detected IPv6: $IPV6"
+IPV6=""
+choose_ipv6
 backup_config
 
 GEMINI_IPV6="$IPV6" python3 - <<'PY'

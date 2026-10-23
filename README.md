@@ -1,7 +1,7 @@
-# ssb-gemini-v6-patch — Gemini и Google через IPv6 для Secret-Sing-Box
+# ssb-gemini-v6-patch — Gemini, Antigravity и Google через IPv6 для Secret-Sing-Box
 
 Патч-скрипт для серверов [Secret-Sing-Box (ssb)](https://github.com/A-Zuro/Secret-Sing-Box):
-направляет трафик **Google / Gemini** через **глобальный IPv6** сервера.
+направляет трафик **Google / Gemini / Google Antigravity** через **глобальный IPv6** сервера.
 
 Аналог решения для Xray / 3X-UI (outbound `freedom` + `sendThrough` + routing rule)
 из статьи «Gemini — решение для РФ через ipv6» (checkvpn.net), адаптированный под
@@ -9,11 +9,10 @@ sing-box 1.12+ и конфиги, которые генерирует ssb.
 
 ## Зачем это нужно
 
-Google-сервисы (в том числе Gemini) могут блокироваться, отвечать капчей или
-отказывать при выходе с IPv4 адресов дата-центров, тогда как с IPv6 того же
-сервера всё работает. Скрипт добавляет в серверный конфиг sing-box отдельный
-outbound, который соединяется с Google с исходным адресом вашего IPv6, и
-маршрутизирует на него Google-домены.
+Google-сервисы (в том числе Gemini и Google Antigravity) могут блокироваться, отвечать капчей
+или отказывать при выходе с IPv4 адресов дата-центров, тогда как с IPv6 того же сервера всё
+работает. Скрипт добавляет в серверный конфиг sing-box отдельный outbound, который соединяется
+с Google с исходным адресом вашего IPv6, и маршрутизирует на него Google-домены.
 
 Схема клиента не меняется (клиент → прокси → сервер), меняется только выход
 сервера для Google-доменов. **Клиентские конфиги ssb трогать не нужно.**
@@ -26,7 +25,8 @@ outbound, который соединяется с Google с исходным а
 | `sendThrough: <IPv6>` | `inet6_bind_address: <IPv6>` |
 | `settings.domainStrategy: "UseIPv6"` | `domain_resolver: { server, strategy: "ipv6_only" }` |
 | rule `geosite:google` | `rule_set: ["google"]` (geosite-google.srs) |
-| rule `domain:gemini.google.com` + `domain:generativelanguage.googleapis.com` | `domain: [...]` |
+| rule `domain:gemini.google.com` + `domain:generativelanguage.googleapis.com` | `domain: [...]` (Gemini + Antigravity) |
+| — (нет аналога) | outbound `gemini-v4`: обычный `direct` для Google-хостов без AAAA |
 
 ## Что делает скрипт
 
@@ -44,17 +44,20 @@ outbound, который соединяется с Google с исходным а
    неверный адрес отклоняется с повторным запросом.
 2. **Делает бэкап** `/etc/sing-box/config.json` в `/root/bak-singbox/config.json.bak-<дата>`
    (хранит последние 10 копий).
-3. **Вносит три изменения в конфиг** (идемпотентно — повторный запуск не плодит дубликаты):
+3. **Вносит изменения в конфиг** (идемпотентно — повторный запуск не плодит дубликаты):
    * rule-set `google` → `geosite-google.srs` (копирует из webroot ssb или докачивает с SagerNet);
    * outbound `gemini-v6`: `direct` + `inet6_bind_address` + `domain_resolver`
      со стратегией `ipv6_only` (аналог `UseIPv6`);
-   * два routing-правила (перед остальными outbound-правилами):
+   * outbound `gemini-v4`: обычный `direct` без bind — для Google-хостов без AAAA
+     (см. раздел «Google Antigravity»);
+   * три routing-правила (перед остальными outbound-правилами):
+     * `domain_suffix: ["antigravity.google"]` → `gemini-v4`
      * `rule_set: ["google"]` → `gemini-v6`
-     * `domain: ["gemini.google.com", "generativelanguage.googleapis.com"]` → `gemini-v6`
+     * `domain: [...]` → `gemini-v6` (Gemini + Antigravity, полный список — ниже)
 4. **Проверяет конфиг** через `sing-box check` — при ошибке автоматически
    откатывает бэкап.
 5. **Перезагружает sing-box** (`systemctl reload`, fallback `systemctl restart`).
-6. **Прогоняет тесты связи с Gemini по IPv6** (7 проверок, см. ниже) — чтобы
+6. **Прогоняет тесты связи с Gemini и Antigravity по IPv6** (13 проверок, см. ниже) — чтобы
    убедиться, что всё работает на 100%. Отдельный запуск без правок конфига:
    `ssb-gemini-v6-patch.sh test`.
 
@@ -90,6 +93,47 @@ gemini.google.com  через outbound gemini-v6 -> {"delay": 49} ms
 работает для трафика, который приходит на сервер через прокси-клиент ssb;
 в клиентских конфигах Google должен быть направлен в прокси (в ssb это
 правило `rule_set: google` уже есть — как и в этом патче).
+
+## Google Antigravity
+
+[Google Antigravity](https://antigravity.google.com/) — агентная IDE и CLI (`agy`) от Google
+на моделях Gemini (развитие идей Gemini CLI / Firebase Studio). Весь его бэкенд —
+Google-инфраструктура, поэтому Antigravity покрывается теми же правилами, что и Gemini:
+как rule-set `google`, так и явным списком доменов в патче.
+
+Домены Antigravity (по [официальной странице network allowlist](https://antigravity.google/docs/enterprise)):
+
+| Сервис / домен | Назначение | Как покрывается |
+|---|---|---|
+| `antigravity.google.com` | веб-интерфейс / Remote Control | суффикс `google.com` + явное правило патча |
+| `cloudcode-pa.googleapis.com` | Code Assist backend (основной) | суффикс `googleapis.com` + явное правило |
+| `daily-cloudcode-pa.googleapis.com` | canary-бэкенд Code Assist | суффикс `googleapis.com` + явное правило |
+| `businessaicode.googleapis.com` (+ `*.us/eu.rep`, `*.mtls`) | AI Developer Tools: sign-in, каталог моделей | суффикс `googleapis.com` + явное правило |
+| `aiplatform.googleapis.com` (+ `*.us/eu.rep`, `*.mtls`) | Gemini Enterprise API (Vertex AI) | суффикс `googleapis.com` + явное правило |
+| `discoveryengine.googleapis.com` (us/eu, mtls) | Discovery Engine | суффикс `googleapis.com` + явное правило |
+| `oauth2.googleapis.com`, `accounts.google.com` | логин Google | суффиксы `googleapis.com` / `google.com` |
+
+Явный список доменов Antigravity в правиле патча:
+
+```text
+antigravity.google.com cloudcode-pa.googleapis.com daily-cloudcode-pa.googleapis.com
+businessaicode.googleapis.com aiplatform.googleapis.com discoveryengine.googleapis.com
+```
+
+### Особый случай: antigravity.google (документация) — хост без IPv6
+
+Сайт документации `antigravity.google` (и `www.antigravity.google`) имеет **только A-запись**
+(IPv6/AAAA нет). При этом rule-set `google` (geosite:google) включает весь TLD `.google`,
+то есть этот домен попадал бы в outbound `gemini-v6` с `domain_resolver: ipv6_only` —
+такое соединение не установится (резолвится только AAAA). Поэтому патч добавляет
+**fallback-outbound `gemini-v4`** (обычный `direct` без bind) и правило
+
+```json
+{ "domain_suffix": ["antigravity.google"], "outbound": "gemini-v4" }
+```
+
+**перед** правилом `rule_set: google`. Список хостов без AAAA задаётся переменной
+`GEMINI_IPV4_ONLY_DOMAINS` (по умолчанию `antigravity.google`; пустая строка — fallback отключён).
 
 ## Требования
 
@@ -139,39 +183,54 @@ Enter the IPv6 of this server (number or full address) [default: 2001:db8:1::10]
 (автоопределённый адрес). Невалидный ввод (например, `fe80::…` или ULA `fd00::…`)
 отклоняется, и запрос повторяется.
 
-### Тесты связи с Gemini по IPv6
+### Тесты связи с Gemini и Antigravity по IPv6
 
-`ssb-gemini-v6-patch.sh test` (и автоматически в конце `apply`) прогоняет 7 проверок —
-они показывают, что Gemini доступен именно через ваш IPv6, «на 100%»:
+`ssb-gemini-v6-patch.sh test` (и автоматически в конце `apply`) прогоняет 13 проверок —
+они показывают, что Gemini и Antigravity доступны именно через ваш IPv6, «на 100%»:
 
 1. IPv6 назначен на интерфейсе сервера (иначе `inet6_bind_address` не сможет bind);
 2. у `gemini.google.com` есть AAAA-запись (в `domain_resolver` стоит `ipv6_only`);
-3. `https://gemini.google.com/generate_204` через IPv6 → **HTTP 204**;
-4. `https://www.google.com/generate_204` через IPv6 → **HTTP 204** (контрольная точка);
-5. `https://generativelanguage.googleapis.com/` через IPv6 отвечает (2xx–4xx;
+3. у `antigravity.google.com` есть AAAA-запись;
+4. у `cloudcode-pa.googleapis.com` (Code Assist Antigravity) есть AAAA-запись;
+5. `https://gemini.google.com/generate_204` через IPv6 → **HTTP 204**;
+6. `https://antigravity.google.com/generate_204` через IPv6 → **HTTP 204**;
+7. `https://www.google.com/generate_204` через IPv6 → **HTTP 204** (контрольная точка);
+8. `https://generativelanguage.googleapis.com/` через IPv6 отвечает (2xx–4xx;
    404 на корне — норма, важна сама доступность API Gemini);
-6. исходящий адрес соединения равен вашему IPv6 (нет NAT/маскарада) —
-   проверяется по `api6.ipify.org` / `ifconfig.me`;
-7. **сквозной тест через сам outbound `gemini-v6`** sing-box: запрос к
-   `gemini.google.com/generate_204` через Clash API (`experimental.clash_api`)
-   и замер задержки. Если `clash_api` в конфиге не включён — проверка
-   помечается `[SKIP]`.
+9. `https://cloudcode-pa.googleapis.com/` через IPv6 отвечает (2xx–4xx; 404 на корне — норма);
+10. исходящий адрес соединения равен вашему IPv6 (нет NAT/маскарада) —
+    проверяется по `api6.ipify.org` / `ifconfig.me`;
+11. **сквозной тест через сам outbound `gemini-v6`** sing-box: запрос к
+    `gemini.google.com/generate_204` через Clash API (`experimental.clash_api`)
+    и замер задержки;
+12. сквозной тест через outbound `gemini-v6` → `antigravity.google.com/generate_204`;
+13. сквозной тест через outbound `gemini-v4` → `antigravity.google`
+    (docs, IPv4-only хост, fallback). Если fallback отключён или outbound
+    `gemini-v4` в конфиге отсутствует — проверка пропускается.
 
-Пример вывода (реальный прогон):
+Если `clash_api` в конфиге не включён — проверки 11–13 помечаются `[SKIP]`.
+
+Пример вывода (реальный прогон на рабочем сервере, IPv6 замаскирован):
 
 ```text
-=== connectivity tests to Gemini/Google (source IPv6: 2001:db8:1::10) ===
+=== connectivity tests to Gemini/Google Antigravity (source IPv6: 2001:db8:1::10) ===
   [OK]   IPv6 2001:db8:1::10 is assigned on this server
   [OK]   DNS: gemini.google.com resolves to IPv6 (AAAA)
+  [OK]   DNS: antigravity.google.com resolves to IPv6 (AAAA)
+  [OK]   DNS: cloudcode-pa.googleapis.com resolves to IPv6 (AAAA)
   [OK]   gemini.google.com/generate_204 via IPv6 -> HTTP 204
+  [OK]   antigravity.google.com/generate_204 via IPv6 -> HTTP 204
   [OK]   www.google.com/generate_204 via IPv6 -> HTTP 204
   [OK]   generativelanguage.googleapis.com via IPv6 -> HTTP 404 (reachable)
+  [OK]   cloudcode-pa.googleapis.com via IPv6 -> HTTP 404 (reachable)
   [OK]   outbound source address is 2001:db8:1::10 (no NAT)
-  [OK]   sing-box outbound gemini-v6 -> gemini.google.com works (delay 55 ms)
---- tests: OK=7 FAIL=0 SKIP=0
+  [OK]   sing-box outbound gemini-v6 -> gemini.google.com works (delay 71 ms)
+  [OK]   sing-box outbound gemini-v6 -> antigravity.google.com works (delay 48 ms)
+  [OK]   sing-box outbound gemini-v4 -> antigravity.google (docs, IPv4-only host) works (delay 51 ms)
+--- tests: OK=13 FAIL=0 SKIP=0
 ```
 
-* Итог `OK=7 FAIL=0` = всё работает; при любом `[FAIL]` скрипт завершается
+* Итог `OK=13 FAIL=0` = всё работает; при любом `[FAIL]` скрипт завершается
   с кодом 1 и пишет, какая именно проверка не прошла.
 * `test` сам берёт IPv6 из настроенного outbound `gemini-v6` (правки конфига
   не делает); можно передать адрес и вручную: `ssb-gemini-v6-patch.sh test 2001:db8:1::10`.
@@ -179,18 +238,19 @@ Enter the IPv6 of this server (number or full address) [default: 2001:db8:1::10]
   (например, в cron/ansible, где доступ в интернет ограничен).
 * Таймаут HTTP-проверок — `GEMINI_TEST_TIMEOUT` (по умолчанию 15 секунд).
 
-Пример вывода `apply` (адреса условные):
+Пример вывода `apply` (реальный прогон, IPv6 замаскирован):
 
 ```text
-[gemini-v6-patch] IPv6 (manual input): 2001:db8:1::10
-[gemini-v6-patch] backup: /root/bak-singbox/config.json.bak-20261018-120000
-rule_set added: google -> /var/www/<RULESET_DIR>/geosite-google.srs
+[gemini-v6-patch] IPv6 (command-line argument): 2001:db8:1::10
+[gemini-v6-patch] backup: /root/bak-singbox/config.json.bak-20261023-091605
+rule_set exists: google -> /var/www/<RULESET_DIR>/geosite-google.srs
 outbound added: gemini-v6 inet6_bind_address=2001:db8:1::10 dns=dns-main
-rules added at 3 : [{"rule_set": ["google"], "outbound": "gemini-v6"}, {"domain": ["gemini.google.com", "generativelanguage.googleapis.com"], "outbound": "gemini-v6"}]
+outbound added: gemini-v4 (plain direct for hosts without AAAA)
+rules added at 3 : [{"domain_suffix": ["antigravity.google"], "outbound": "gemini-v4"}, {"rule_set": ["google"], "outbound": "gemini-v6"}, {"domain": ["gemini.google.com", "generativelanguage.googleapis.com", "antigravity.google.com", "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "businessaicode.googleapis.com", "aiplatform.googleapis.com", "discoveryengine.googleapis.com"], "outbound": "gemini-v6"}]
 config written: /etc/sing-box/config.json
 [gemini-v6-patch] sing-box check: OK
 [gemini-v6-patch] service sing-box reloaded
-[gemini-v6-patch] done: gemini traffic -> gemini-v6 -> IPv6
+[gemini-v6-patch] done: gemini + antigravity traffic -> gemini-v6 -> IPv6
 ```
 
 ### Переменные окружения
@@ -201,6 +261,7 @@ config written: /etc/sing-box/config.json
 | `GEMINI_CONFIG` | путь к конфигу sing-box | `/etc/sing-box/config.json` |
 | `GEMINI_BACKUP_DIR` | каталог бэкапов | `/root/bak-singbox` |
 | `GEMINI_SERVICE` | имя systemd-юнита | `sing-box` |
+| `GEMINI_IPV4_ONLY_DOMAINS` | Google-хосты без AAAA, идущие через `gemini-v4` | `antigravity.google` (пустая строка — отключить fallback) |
 
 Пример: `GEMINI_IPV6=2001:db8:1::10 ssb-gemini-v6-patch.sh apply`
 
@@ -213,12 +274,18 @@ config written: /etc/sing-box/config.json
     "tag": "gemini-v6",
     "inet6_bind_address": "2001:db8:1::10",
     "domain_resolver": { "server": "dns-main", "strategy": "ipv6_only" }
-  }
+  },
+  { "type": "direct", "tag": "gemini-v4" }
 ],
 "route": {
   "rules": [
+    { "domain_suffix": ["antigravity.google"], "outbound": "gemini-v4" },
     { "rule_set": ["google"], "outbound": "gemini-v6" },
-    { "domain": ["gemini.google.com", "generativelanguage.googleapis.com"], "outbound": "gemini-v6" }
+    { "domain": ["gemini.google.com", "generativelanguage.googleapis.com",
+                 "antigravity.google.com", "cloudcode-pa.googleapis.com",
+                 "daily-cloudcode-pa.googleapis.com", "businessaicode.googleapis.com",
+                 "aiplatform.googleapis.com", "discoveryengine.googleapis.com"],
+      "outbound": "gemini-v6" }
   ],
   "rule_set": [
     { "tag": "google", "type": "local", "format": "binary",
@@ -286,7 +353,7 @@ systemctl reload sing-box
   аргументом/`GEMINI_IPV6`). В режиме без терминала (cron) берётся адрес
   исходящего маршрута (`ip -6 route get`).
 * Скрипт идемпотентен: повторный `apply` сначала удаляет свои элементы
-  (outbound с тегом `gemini-v6`, его правила, свой rule-set) и добавляет заново.
+  (outbounds `gemini-v6` и `gemini-v4`, их правила, свой rule-set) и добавляет заново.
 * Патч работает на стороне **сервера**: клиентские конфиги ssb уже отправляют
   Google (`rule_set: google`) в прокси, а сервер выбирает для него IPv6-выход.
 
@@ -300,10 +367,17 @@ systemctl reload sing-box
 * ручной ввод IPv6: выбор номера из списка, ввод полного адреса и адреса с `/64`,
   отклонение невалидного ввода (`fe80::…`, ULA) с повторным запросом,
   режимы `apply <IPv6>` и `GEMINI_IPV6=...`, а также `remove` → повторный `apply`;
-* режим `test` и автотест в конце `apply`: 7 проверок связи с Gemini по IPv6
-  (назначение адреса, AAAA, `generate_204` → 204, доступность API Gemini,
-  исходящий адрес без NAT, сквозной тест через outbound `gemini-v6` с замером
-  задержки) — `OK=7 FAIL=0` на рабочем сервере;
+* режим `test` и автотест в конце `apply`: 13 проверок связи с Gemini и Antigravity
+  по IPv6 (назначение адреса, AAAA, `generate_204` → 204, доступность API Gemini
+  и Code Assist Antigravity, исходящий адрес без NAT, сквозные тесты через outbound
+  `gemini-v6` и fallback `gemini-v4` с замером задержки) — `OK=13 FAIL=0 SKIP=0`
+  на рабочем сервере (реальный прогон 23.10.2026, sing-box 1.14.3, Ubuntu 24.04);
+* Google Antigravity: `antigravity.google.com/generate_204` через глобальный IPv6
+  → HTTP 204, `cloudcode-pa.googleapis.com` → HTTP 404 (reachable), сквозные тесты
+  через outbound `gemini-v6` (48 ms) и `gemini-v4` для docs-сайта (51 ms);
+* хосты без AAAA (`antigravity.google`): правило `domain_suffix → gemini-v4`
+  стоит **до** `rule_set: google` — соединение к docs-сайту устанавливается,
+  проверено сквозным тестом через outbound `gemini-v4`;
 * Google AI Studio: `aistudio.google.com` доступен через глобальный IPv6
   (HTTP 302) и проходит через outbound `gemini-v6` (сквозной тест с замером
   задержки) — домен покрывается rule-set `google` (geosite:google).

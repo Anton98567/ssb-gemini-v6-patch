@@ -5,11 +5,21 @@ CONFIG="${GEMINI_CONFIG:-/etc/sing-box/config.json}"
 BACKUP_DIR="${GEMINI_BACKUP_DIR:-/root/bak-singbox}"
 SERVICE="${GEMINI_SERVICE:-sing-box}"
 TAG="gemini-v6"
+TAG4="gemini-v4"
 RULESET_TAG="google"
 SRS_NAME="geosite-google.srs"
 SRS_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
 PROBE="2001:4860:4860::8888"
 GEMINI_DOMAINS="gemini.google.com generativelanguage.googleapis.com"
+# Google Antigravity (app/CLI/IDE): web endpoint + Code Assist backends.
+# All of them have AAAA records and go via the IPv6 outbound; the rest of the
+# Antigravity stack (oauth2.googleapis.com, *.rep.googleapis.com, ...) is
+# covered by the rule-set "google" (geosite:google).
+ANTIGRAVITY_DOMAINS="antigravity.google.com cloudcode-pa.googleapis.com daily-cloudcode-pa.googleapis.com businessaicode.googleapis.com aiplatform.googleapis.com discoveryengine.googleapis.com"
+# Google hosts WITHOUT an AAAA record (A-only): the IPv6 outbound resolves with
+# ipv6_only and cannot connect to them, so they go via a plain direct fallback.
+# Set GEMINI_IPV4_ONLY_DOMAINS="" to disable the fallback rule entirely.
+IPV4_ONLY_DOMAINS="${GEMINI_IPV4_ONLY_DOMAINS-antigravity.google}"
 MODE="${1:-apply}"
 ARG_IPV6="${2:-}"
 
@@ -18,10 +28,10 @@ die() { echo "[gemini-v6-patch] ERROR: $*" >&2; exit 1; }
 
 usage() {
     echo "usage: $0 [apply|remove|status|test] [IPv6]"
-    echo "  apply [IPv6] - add or refresh gemini-via-IPv6 patch in ${CONFIG} (default)"
+    echo "  apply [IPv6] - add or refresh gemini+antigravity via IPv6 patch in ${CONFIG} (default)"
     echo "  remove       - drop outbound/rules added by this patch"
     echo "  status       - show current patch state"
-    echo "  test  [IPv6] - check IPv6 connectivity to Gemini/Google (no config changes)"
+    echo "  test  [IPv6] - check IPv6 connectivity to Gemini/Google Antigravity (no config changes)"
     echo
     echo "IPv6 selection (apply/test), in priority order:"
     echo "  1) argument:    $0 apply 2001:db8::1"
@@ -30,6 +40,11 @@ usage() {
     echo "  4) auto-detection (ip -6 route get $PROBE) as a last resort"
     echo
     echo "apply runs the same connectivity tests at the end (skip: GEMINI_SKIP_TEST=1)"
+    echo
+    echo "Google Antigravity (antigravity.google.com, cloudcode-pa.googleapis.com, ...)"
+    echo "is routed via the same IPv6 outbound. IPv4-only Google hosts (no AAAA, e.g. the"
+    echo "antigravity.google docs site) go via the $TAG4 direct fallback;"
+    echo "override the list with GEMINI_IPV4_ONLY_DOMAINS=\"...\" (empty = disable fallback)"
 }
 
 # Normalizes and validates an IPv6 address -> prints compressed form.
@@ -139,6 +154,15 @@ choose_ipv6() {
 TESTS_OK=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
+TEST_IP=""
+
+_ok()   { TESTS_OK=$((TESTS_OK + 1));         printf '  [OK]   %s\n' "$1"; }
+_bad()  { TESTS_FAILED=$((TESTS_FAILED + 1)); printf '  [FAIL] %s\n' "$1"; }
+_skip() { TESTS_SKIPPED=$((TESTS_SKIPPED + 1)); printf '  [SKIP] %s\n' "$1"; }
+
+# Test hosts (Gemini + Google Antigravity): they must resolve to IPv6 (AAAA),
+# since the outbound resolves its destinations with ipv6_only.
+DNS_TEST_HOSTS="gemini.google.com antigravity.google.com cloudcode-pa.googleapis.com"
 
 configured_ipv6() {
     python3 - <<'PY'
@@ -178,93 +202,64 @@ http_code() {
     printf '%s' "${out:-000}"
 }
 
-run_tests() {
-    local ip="$1"
-    TESTS_OK=0
-    TESTS_FAILED=0
-    TESTS_SKIPPED=0
-    _ok()   { TESTS_OK=$((TESTS_OK + 1));         printf '  [OK]   %s\n' "$1"; }
-    _bad()  { TESTS_FAILED=$((TESTS_FAILED + 1)); printf '  [FAIL] %s\n' "$1"; }
-    _skip() { TESTS_SKIPPED=$((TESTS_SKIPPED + 1)); printf '  [SKIP] %s\n' "$1"; }
-
-    echo "=== connectivity tests to Gemini/Google (source IPv6: $ip) ==="
-
-    # 1. address must be assigned on the server (inet6_bind_address binds to it)
-    if ip -6 addr show 2>/dev/null | grep -Fq "$ip"; then
-        _ok "IPv6 $ip is assigned on this server"
+# DNS: <host> must have an AAAA record (the outbound resolves with ipv6_only).
+check_dns_aaaa() {
+    local host="$1"
+    if python3 -c 'import socket, sys; socket.getaddrinfo(sys.argv[1], 443, socket.AF_INET6)' "$host" 2>/dev/null; then
+        _ok "DNS: $host resolves to IPv6 (AAAA)"
     else
-        _bad "IPv6 $ip is NOT assigned on this server - outbound bind will fail"
+        _bad "DNS: $host has no IPv6 (AAAA) record"
     fi
+}
 
-    # 2. DNS: gemini.google.com must have an AAAA record (domain_resolver uses ipv6_only)
-    if python3 -c 'import socket, sys; socket.getaddrinfo(sys.argv[1], 443, socket.AF_INET6)' gemini.google.com 2>/dev/null; then
-        _ok "DNS: gemini.google.com resolves to IPv6 (AAAA)"
-    else
-        _bad "DNS: gemini.google.com has no IPv6 (AAAA) record"
-    fi
-
-    if ! command -v curl >/dev/null 2>&1; then
-        _skip "HTTP tests (curl is not installed)"
-    else
-        local code
-
-        # 3. Gemini via bound IPv6 - generate_204 endpoint
-        code="$(http_code "https://gemini.google.com/generate_204" "$ip")"
-        if [[ "$code" == "204" ]]; then
-            _ok "gemini.google.com/generate_204 via IPv6 -> HTTP 204"
-        else
-            _bad "gemini.google.com/generate_204 via IPv6 -> HTTP $code (expected 204)"
-        fi
-
-        # 4. control endpoint (google.com)
-        code="$(http_code "https://www.google.com/generate_204" "$ip")"
-        if [[ "$code" == "204" ]]; then
-            _ok "www.google.com/generate_204 via IPv6 -> HTTP 204"
-        else
-            _bad "www.google.com/generate_204 via IPv6 -> HTTP $code (expected 204)"
-        fi
-
-        # 5. Gemini API endpoint (any 2xx-4xx proves reachability; 404 on / is normal)
-        code="$(http_code "https://generativelanguage.googleapis.com/" "$ip")"
+# HTTP via the bound IPv6: <expect> is an exact code ("204") or "2xx-4xx" (reachable).
+check_http() {
+    local label="$1" url="$2" expect="$3" code=""
+    code="$(http_code "$url" "$TEST_IP")"
+    if [[ "$expect" == "2xx-4xx" ]]; then
         if [[ "$code" =~ ^[234][0-9][0-9]$ ]]; then
-            _ok "generativelanguage.googleapis.com via IPv6 -> HTTP $code (reachable)"
+            _ok "$label via IPv6 -> HTTP $code (reachable)"
         else
-            _bad "generativelanguage.googleapis.com via IPv6 -> HTTP $code (unreachable)"
+            _bad "$label via IPv6 -> HTTP $code (unreachable)"
         fi
+    elif [[ "$code" == "$expect" ]]; then
+        _ok "$label via IPv6 -> HTTP $code"
+    else
+        _bad "$label via IPv6 -> HTTP $code (expected $expect)"
+    fi
+}
 
-        # 6. outbound source address must be exactly our IPv6 (no NAT/masquerade)
-        local seen=""
-        seen="$(curl -6 -s --interface "$ip" --max-time "${GEMINI_TEST_TIMEOUT:-15}" https://api6.ipify.org 2>/dev/null || true)"
-        if [[ -z "$seen" ]]; then
-            seen="$(curl -6 -s --interface "$ip" --max-time "${GEMINI_TEST_TIMEOUT:-15}" https://ifconfig.me 2>/dev/null || true)"
-        fi
-        if [[ -n "$seen" ]]; then
-            local seen_n
-            seen_n="$(normalize_ipv6 "$seen" 2>/dev/null || echo "$seen")"
-            if [[ "$seen_n" == "$ip" ]]; then
-                _ok "outbound source address is $ip (no NAT)"
-            else
-                _bad "outbound source is $seen_n, expected $ip (NAT/masquerade?)"
-            fi
-        else
-            _skip "outbound source address check (no response from api6.ipify.org)"
-        fi
+# True if the config has an outbound with the given tag.
+has_outbound() {
+    python3 -c '
+import json, os, sys
+try:
+    cfg = json.load(open(os.environ["GEMINI_CONFIG"]))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if any(o.get("tag") == sys.argv[1] for o in cfg.get("outbounds", [])) else 1)
+' "$1"
+}
 
-        # 7. end-to-end via sing-box outbound itself (Clash API delay test)
-        local ci="" ctrl="" secret="" resp="" delay="" msg=""
-        ci="$(clash_api_info || true)"
-        if [[ -z "$ci" ]]; then
-            _skip "test via sing-box outbound $TAG (clash_api is not enabled in ${CONFIG})"
-        else
-            ctrl="${ci%% *}"
-            secret="${ci#* }"
-            [[ "$secret" == "$ctrl" ]] && secret=""
-            local cargs=(-s --max-time 15)
-            if [[ -n "$secret" ]]; then
-                cargs+=(-H "Authorization: Bearer $secret")
-            fi
-            resp="$(curl "${cargs[@]}" "http://$ctrl/proxies/$TAG/delay?url=https%3A%2F%2Fgemini.google.com%2Fgenerate_204&timeout=10000" 2>/dev/null || true)"
-            delay="$(python3 -c '
+# End-to-end request via the sing-box outbound itself (Clash API delay test).
+check_outbound_delay() {
+    local outbound="$1" label="$2" url="$3"
+    local url_enc="" ci="" ctrl="" secret="" resp="" delay="" msg=""
+    url_enc="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")"
+    ci="$(clash_api_info || true)"
+    if [[ -z "$ci" ]]; then
+        _skip "test via sing-box outbound $outbound -> $label (clash_api is not enabled in ${CONFIG})"
+        return 0
+    fi
+    ctrl="${ci%% *}"
+    secret="${ci#* }"
+    [[ "$secret" == "$ctrl" ]] && secret=""
+    local cargs=(-s --max-time 15)
+    if [[ -n "$secret" ]]; then
+        cargs+=(-H "Authorization: Bearer $secret")
+    fi
+    resp="$(curl "${cargs[@]}" "http://$ctrl/proxies/$outbound/delay?url=$url_enc&timeout=10000" 2>/dev/null || true)"
+    delay="$(python3 -c '
 import json, sys
 try:
     d = json.loads(sys.argv[1])
@@ -272,10 +267,10 @@ except Exception:
     raise SystemExit(0)
 print(d.get("delay") or "")
 ' "$resp" 2>/dev/null || true)"
-            if [[ -n "$delay" ]]; then
-                _ok "sing-box outbound $TAG -> gemini.google.com works (delay ${delay} ms)"
-            else
-                msg="$(python3 -c '
+    if [[ -n "$delay" ]]; then
+        _ok "sing-box outbound $outbound -> $label works (delay ${delay} ms)"
+    else
+        msg="$(python3 -c '
 import json, sys
 try:
     d = json.loads(sys.argv[1])
@@ -283,8 +278,68 @@ try:
 except Exception:
     print(sys.argv[1][:150] or "no response from clash_api")
 ' "$resp" 2>/dev/null || true)"
-                _bad "sing-box outbound $TAG -> gemini.google.com failed: $msg"
+        _bad "sing-box outbound $outbound -> $label failed: $msg"
+    fi
+}
+
+run_tests() {
+    TEST_IP="$1"
+    TESTS_OK=0
+    TESTS_FAILED=0
+    TESTS_SKIPPED=0
+
+    echo "=== connectivity tests to Gemini/Google Antigravity (source IPv6: $TEST_IP) ==="
+
+    # 1. address must be assigned on the server (inet6_bind_address binds to it)
+    if ip -6 addr show 2>/dev/null | grep -Fq "$TEST_IP"; then
+        _ok "IPv6 $TEST_IP is assigned on this server"
+    else
+        _bad "IPv6 $TEST_IP is NOT assigned on this server - outbound bind will fail"
+    fi
+
+    # 2. DNS: test hosts must have AAAA records (domain_resolver uses ipv6_only)
+    local host
+    for host in $DNS_TEST_HOSTS; do
+        check_dns_aaaa "$host"
+    done
+
+    if ! command -v curl >/dev/null 2>&1; then
+        _skip "HTTP tests (curl is not installed)"
+    else
+        # 3-4. Gemini and Antigravity web endpoints answer generate_204 with HTTP 204
+        check_http "gemini.google.com/generate_204" "https://gemini.google.com/generate_204" "204"
+        check_http "antigravity.google.com/generate_204" "https://antigravity.google.com/generate_204" "204"
+
+        # 5. control endpoint (google.com)
+        check_http "www.google.com/generate_204" "https://www.google.com/generate_204" "204"
+
+        # 6-7. API backends (any 2xx-4xx proves reachability; 404 on / is normal)
+        check_http "generativelanguage.googleapis.com" "https://generativelanguage.googleapis.com/" "2xx-4xx"
+        check_http "cloudcode-pa.googleapis.com" "https://cloudcode-pa.googleapis.com/" "2xx-4xx"
+
+        # 8. outbound source address must be exactly our IPv6 (no NAT/masquerade)
+        local seen=""
+        seen="$(curl -6 -s --interface "$TEST_IP" --max-time "${GEMINI_TEST_TIMEOUT:-15}" https://api6.ipify.org 2>/dev/null || true)"
+        if [[ -z "$seen" ]]; then
+            seen="$(curl -6 -s --interface "$TEST_IP" --max-time "${GEMINI_TEST_TIMEOUT:-15}" https://ifconfig.me 2>/dev/null || true)"
+        fi
+        if [[ -n "$seen" ]]; then
+            local seen_n
+            seen_n="$(normalize_ipv6 "$seen" 2>/dev/null || echo "$seen")"
+            if [[ "$seen_n" == "$TEST_IP" ]]; then
+                _ok "outbound source address is $TEST_IP (no NAT)"
+            else
+                _bad "outbound source is $seen_n, expected $TEST_IP (NAT/masquerade?)"
             fi
+        else
+            _skip "outbound source address check (no response from api6.ipify.org)"
+        fi
+
+        # 9-11. end-to-end via the sing-box outbounds themselves (Clash API delay tests)
+        check_outbound_delay "$TAG" "gemini.google.com" "https://gemini.google.com/generate_204"
+        check_outbound_delay "$TAG" "antigravity.google.com" "https://antigravity.google.com/generate_204"
+        if has_outbound "$TAG4"; then
+            check_outbound_delay "$TAG4" "antigravity.google (docs, IPv4-only host)" "https://antigravity.google/"
         fi
     fi
 
@@ -326,19 +381,23 @@ esac
 
 [[ -s "$CONFIG" ]] || die "config not found: $CONFIG"
 
-export GEMINI_MODE="$MODE" GEMINI_CONFIG="$CONFIG" GEMINI_TAG="$TAG" \
+export GEMINI_MODE="$MODE" GEMINI_CONFIG="$CONFIG" GEMINI_TAG="$TAG" GEMINI_TAG4="$TAG4" \
     GEMINI_RULESET_TAG="$RULESET_TAG" GEMINI_SRS_NAME="$SRS_NAME" GEMINI_SRS_URL="$SRS_URL" \
-    GEMINI_DOMAINS="$GEMINI_DOMAINS"
+    GEMINI_DOMAINS="$GEMINI_DOMAINS" GEMINI_ANTIGRAVITY_DOMAINS="$ANTIGRAVITY_DOMAINS" \
+    GEMINI_IPV4_ONLY_DOMAINS="$IPV4_ONLY_DOMAINS"
 
 if [[ "$MODE" == "status" ]]; then
     python3 - <<'PY'
 import json, os
 cfg = json.load(open(os.environ["GEMINI_CONFIG"]))
 tag = os.environ["GEMINI_TAG"]
-obs = [o for o in cfg.get("outbounds", []) if o.get("tag") == tag]
-rules = [r for r in cfg.get("route", {}).get("rules", []) if r.get("outbound") == tag]
+tag4 = os.environ["GEMINI_TAG4"]
+tags = (tag, tag4)
+obs = {o.get("tag"): o for o in cfg.get("outbounds", []) if o.get("tag") in tags}
+rules = [r for r in cfg.get("route", {}).get("rules", []) if r.get("outbound") in tags]
 rss = [r for r in cfg.get("route", {}).get("rule_set", []) if r.get("tag") == os.environ["GEMINI_RULESET_TAG"]]
-print("outbound:", json.dumps(obs[0], ensure_ascii=False) if obs else "NOT SET")
+print("outbound:", json.dumps(obs.get(tag), ensure_ascii=False) if tag in obs else "NOT SET")
+print("outbound4:", json.dumps(obs.get(tag4), ensure_ascii=False) if tag4 in obs else "NOT SET")
 print("rules:", len(rules))
 for r in rules:
     print("  ", json.dumps(r, ensure_ascii=False))
@@ -354,11 +413,13 @@ if [[ "$MODE" == "remove" ]]; then
 import json, os
 p = os.environ["GEMINI_CONFIG"]
 tag = os.environ["GEMINI_TAG"]
+tag4 = os.environ["GEMINI_TAG4"]
+tags = (tag, tag4)
 rst = os.environ["GEMINI_RULESET_TAG"]
 srs = os.environ["GEMINI_SRS_NAME"]
 cfg = json.load(open(p))
-cfg["outbounds"] = [o for o in cfg.get("outbounds", []) if o.get("tag") != tag]
-cfg["route"]["rules"] = [r for r in cfg["route"].get("rules", []) if r.get("outbound") != tag]
+cfg["outbounds"] = [o for o in cfg.get("outbounds", []) if o.get("tag") not in tags]
+cfg["route"]["rules"] = [r for r in cfg["route"].get("rules", []) if r.get("outbound") not in tags]
 cfg["route"]["rule_set"] = [
     r for r in cfg["route"].get("rule_set", [])
     if not (r.get("tag") == rst and os.path.basename(r.get("path", "")) == srs)
@@ -396,10 +457,13 @@ import glob, json, os, shutil, urllib.request
 
 p = os.environ["GEMINI_CONFIG"]
 tag = os.environ["GEMINI_TAG"]
+tag4 = os.environ["GEMINI_TAG4"]
+tags = (tag, tag4)
 rst = os.environ["GEMINI_RULESET_TAG"]
 srs_name = os.environ["GEMINI_SRS_NAME"]
 srs_url = os.environ["GEMINI_SRS_URL"]
-domains = os.environ["GEMINI_DOMAINS"].split()
+domains = os.environ["GEMINI_DOMAINS"].split() + os.environ["GEMINI_ANTIGRAVITY_DOMAINS"].split()
+ipv4_only = os.environ["GEMINI_IPV4_ONLY_DOMAINS"].split()
 ipv6 = os.environ["GEMINI_IPV6"]
 
 cfg = json.load(open(p))
@@ -442,7 +506,7 @@ if existing_rs is None:
 else:
     print("rule_set exists:", rst, "->", existing_rs.get("path"))
 
-outbounds[:] = [o for o in outbounds if o.get("tag") != tag]
+outbounds[:] = [o for o in outbounds if o.get("tag") not in tags]
 outbounds.append({
     "type": "direct",
     "tag": tag,
@@ -450,9 +514,17 @@ outbounds.append({
     "domain_resolver": {"server": dns_tag, "strategy": "ipv6_only"},
 })
 print("outbound added:", tag, "inet6_bind_address=" + ipv6, "dns=" + dns_tag)
+if ipv4_only:
+    outbounds.append({"type": "direct", "tag": tag4})
+    print("outbound added:", tag4, "(plain direct for hosts without AAAA)")
 
-rules[:] = [r for r in rules if r.get("outbound") != tag]
-new_rules = [
+rules[:] = [r for r in rules if r.get("outbound") not in tags]
+new_rules = []
+if ipv4_only:
+    # must be first: otherwise the rule_set "google" below would send these
+    # hosts to the IPv6 outbound, which cannot connect to IPv4-only names
+    new_rules.append({"domain_suffix": list(ipv4_only), "outbound": tag4})
+new_rules += [
     {"rule_set": [rst], "outbound": tag},
     {"domain": list(domains), "outbound": tag},
 ]
@@ -465,7 +537,7 @@ print("config written:", p)
 PY
 
 check_and_reload
-log "done: gemini traffic -> $TAG -> IPv6"
+log "done: gemini + antigravity traffic -> $TAG -> IPv6"
 
 if [[ "${GEMINI_SKIP_TEST:-0}" == "1" ]]; then
     log "connectivity tests skipped (GEMINI_SKIP_TEST=1)"
